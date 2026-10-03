@@ -5,9 +5,6 @@ name: Deployment architecture
 
 on:
   pull_request:
-    paths:
-      - 'deployment/**'
-      - '.github/workflows/deployment-architecture.yml'
   push:
     paths:
       - 'deployment/**'
@@ -17,19 +14,39 @@ on:
 permissions:
   contents: read
 
+env:
+  COMPOSE_PROJECT_NAME: nextcloud-architecture
+  POSTGRES_PASSWORD: ci-only-postgres-password
+  NEXTCLOUD_ADMIN_USER: admin
+  NEXTCLOUD_ADMIN_PASSWORD: ci-only-nextcloud-password
+
 concurrency:
   group: deployment-architecture-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  compose-smoke-test:
+  changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      COMPOSE_PROJECT_NAME: nextcloud-architecture
-      POSTGRES_PASSWORD: ci-only-postgres-password
-      NEXTCLOUD_ADMIN_USER: admin
-      NEXTCLOUD_ADMIN_PASSWORD: ci-only-nextcloud-password
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      deployment: ${{ github.event_name != 'pull_request' || steps.filter.outputs.deployment == 'true' }}
+    steps:
+      - name: Detect deployment changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            deployment:
+              - 'deployment/**'
+              - '.github/workflows/deployment-architecture.yml'
+
+  compose-config:
+    needs: changes
+    if: needs.changes.outputs.deployment == 'true'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -39,6 +56,55 @@ jobs:
 
       - name: Validate Compose configuration
         run: docker compose --file deployment/compose.yaml config --quiet
+
+  haproxy-config:
+    needs: changes
+    if: needs.changes.outputs.deployment == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate HAProxy configuration
+        run: docker compose --file deployment/compose.yaml run --rm --no-deps load-balancer haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+
+  backup-script:
+    needs: changes
+    if: needs.changes.outputs.deployment == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check backup shell syntax
+        run: bash -n deployment/backup.sh deployment/tests/backup-script.sh
+
+      - name: Test backup success and failure handling
+        run: bash deployment/tests/backup-script.sh
+
+  compose-smoke-test:
+    needs: changes
+    if: always() && (needs.changes.outputs.deployment == 'true' || needs.changes.result != 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Fail if deployment change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Deployment change detection did not complete successfully: ${{ needs.changes.result }}" >&2
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Start database, cache, and first app server
         run: docker compose --file deployment/compose.yaml up --detach --wait db redis app
@@ -82,3 +148,33 @@ jobs:
       - name: Stop test stack
         if: always()
         run: docker compose --file deployment/compose.yaml down --volumes --remove-orphans
+
+  summary:
+    name: deployment-architecture-summary
+    if: always()
+    needs: [changes, compose-config, haproxy-config, backup-script, compose-smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+    steps:
+      - name: Require deployment smoke test when deployment files change
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DEPLOYMENT_CHANGED: ${{ needs.changes.outputs.deployment }}
+          COMPOSE_CONFIG_RESULT: ${{ needs.compose-config.result }}
+          HAPROXY_CONFIG_RESULT: ${{ needs.haproxy-config.result }}
+          BACKUP_SCRIPT_RESULT: ${{ needs.backup-script.result }}
+          SMOKE_TEST_RESULT: ${{ needs.compose-smoke-test.result }}
+        run: |
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "Change detection did not complete successfully: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          if [ "$DEPLOYMENT_CHANGED" = "true" ]; then
+            for result in "$COMPOSE_CONFIG_RESULT" "$HAPROXY_CONFIG_RESULT" "$BACKUP_SCRIPT_RESULT" "$SMOKE_TEST_RESULT"; do
+              if [ "$result" != "success" ]; then
+                echo "A deployment architecture check did not pass: $result" >&2
+                exit 1
+              fi
+            done
+          fi
